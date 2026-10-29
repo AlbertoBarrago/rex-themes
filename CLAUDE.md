@@ -34,4 +34,4 @@ Two Rex mechanisms, two files per theme in `themes/`:
 
 ## Version control
 
-`jj` (colocated with git), one bookmark per feature. Remote: `AlbertoBarrago/rex-themes` (private).
+`jj` (colocated with git), one bookmark per feature. Remote: `AlbertoBarrago/rex-themes` (public).
