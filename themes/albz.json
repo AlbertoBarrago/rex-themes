@@ -1,0 +1,24 @@
+{
+  "palette": [
+    "0=#0d0f14",
+    "1=#ff5a7a",
+    "2=#5aff8f",
+    "3=#ffcc5a",
+    "4=#7b8cff",
+    "5=#ff5aaa",
+    "6=#5af0ff",
+    "7=#c8d0e8",
+    "8=#4a5270",
+    "9=#ff7b5a",
+    "10=#79ffab",
+    "11=#ffd879",
+    "12=#9aa6ff",
+    "13=#ff79bd",
+    "14=#83f4ff",
+    "15=#e8eeff"
+  ],
+  "background": "#0d0f14",
+  "foreground": "#c8d0e8",
+  "cursor": "#5aff8f",
+  "scheme": "dark"
+}

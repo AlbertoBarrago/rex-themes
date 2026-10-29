@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""rex-theme: manage the rex-themes library from the command line.
+
+Each theme lives in themes/ as two files with the same name:
+
+- <name>.ghostty  the source, in Ghostty's `key = value` format. Rex.app
+                  imports it as an app theme through client.theme.import.
+- <name>.json     the arguments of com.superlogical.terminal.set_theme,
+                  generated from the .ghostty file. That action rejects
+                  unknown keys, so the JSON carries no metadata.
+
+Only the Python standard library is used, so the script runs anywhere Rex does.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+UPSTREAM = "https://raw.githubusercontent.com/mbadolato/iTerm2-Color-Schemes/master/ghostty/"
+ROOT = Path(os.path.realpath(__file__)).parent.parent
+THEMES_DIR = ROOT / "themes"
+HEX = re.compile(r"^#?([0-9a-fA-F]{6})$")
+NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+SET_THEME = "com.superlogical.terminal.set_theme"
+REX_DEFAULTS = "com.superlogical.rex"
+
+
+class CliError(Exception):
+    """An error reported to the user as a single line, with exit status 1."""
+
+
+def slugify(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def normalize_hex(value: str, key: str) -> str:
+    match = HEX.match(value.strip())
+    if not match:
+        raise ValueError(f"{key}: expected RRGGBB, got {value!r}")
+    return "#" + match.group(1).lower()
+
+
+def scheme_for(background: str) -> str:
+    """Classify light or dark by relative luminance (WCAG formula)."""
+    channels = [int(background[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+    linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    luminance = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+    return "light" if luminance > 0.5 else "dark"
+
+
+def parse_ghostty(text: str) -> dict:
+    """Convert Ghostty theme text into set_theme arguments.
+
+    Selection and cursor-text colors have no set_theme equivalent and are
+    dropped here; the .ghostty file keeps them for the app import.
+    """
+    theme: dict = {"palette": []}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = (part.strip() for part in line.partition("="))
+        if not sep:
+            raise ValueError(f"line {lineno}: not a key = value pair: {raw!r}")
+        if key == "palette":
+            index, sep, color = value.partition("=")
+            if not sep or not index.strip().isdigit() or not 0 <= int(index) <= 255:
+                raise ValueError(f"line {lineno}: bad palette entry {value!r}")
+            theme["palette"].append(f"{int(index)}={normalize_hex(color, 'palette')}")
+        elif key in ("background", "foreground"):
+            theme[key] = normalize_hex(value, key)
+        elif key == "cursor-color":
+            theme["cursor"] = normalize_hex(value, key)
+
+    if "background" not in theme or "foreground" not in theme:
+        raise ValueError("theme has no background or foreground")
+    theme["scheme"] = scheme_for(theme["background"])
+    return theme
+
+
+def theme_names() -> list[str]:
+    return sorted(path.stem for path in THEMES_DIR.glob("*.ghostty"))
+
+
+def theme_path(name: str, suffix: str) -> Path:
+    path = THEMES_DIR / f"{name}{suffix}"
+    if not path.is_file():
+        raise CliError(f"unknown theme '{name}' (see: rex-theme list)")
+    return path
+
+
+def rex(*args: str) -> str:
+    try:
+        result = subprocess.run(["rex", *args], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise CliError("rex is not on PATH") from None
+    if result.returncode != 0:
+        raise CliError(result.stderr.strip() or f"rex {args[0]} failed with status {result.returncode}")
+    return result.stdout
+
+
+def block_args(block: str | None) -> list[str]:
+    block = block or os.environ.get("REX_BLOCK")
+    return ["-b", block] if block else []
+
+
+def cmd_list(_: argparse.Namespace) -> None:
+    for name in theme_names():
+        scheme = json.loads(theme_path(name, ".json").read_text()).get("scheme", "?")
+        print(f"{name:<20} {scheme}")
+
+
+def cmd_use(args: argparse.Namespace) -> None:
+    path = theme_path(args.name, ".ghostty")
+    rex("do", "client.theme.import", "--args", json.dumps({"path": str(path)}))
+    print(f"imported {args.name} into Rex and selected it")
+
+
+def cmd_try(args: argparse.Namespace) -> None:
+    path = theme_path(args.name, ".json")
+    rex("do", SET_THEME, "--args", f"@{path}", *block_args(args.block))
+    print(f"applied {args.name} to the block (rex-theme reset to undo)")
+
+
+def cmd_reset(args: argparse.Namespace) -> None:
+    rex("do", SET_THEME, "--args", "{}", *block_args(args.block))
+    print("block colors reset to the app theme")
+
+
+def cmd_current(_: argparse.Namespace) -> None:
+    # Rex.app keeps the selected theme IDs in its macOS defaults domain.
+    for mode in ("dark", "light"):
+        result = subprocess.run(
+            ["defaults", "read", REX_DEFAULTS, f"Workspace.{mode}ThemeID"],
+            capture_output=True,
+            text=True,
+        )
+        value = result.stdout.strip() if result.returncode == 0 else "(default)"
+        print(f"{mode:<6} {value}")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    name = args.name or slugify(Path(args.source).name)
+    if not NAME.match(name):
+        raise CliError(f"invalid theme name '{name}': use lowercase letters, digits and dashes")
+    try:
+        if args.file:
+            text = Path(args.source).expanduser().read_text()
+        else:
+            url = UPSTREAM + urllib.parse.quote(args.source)
+            with urllib.request.urlopen(url, timeout=15) as response:
+                text = response.read().decode("utf-8")
+        theme = parse_ghostty(text)
+    except (OSError, ValueError) as error:
+        raise CliError(f"{args.source}: {error}") from None
+
+    THEMES_DIR.mkdir(exist_ok=True)
+    (THEMES_DIR / f"{name}.ghostty").write_text(text if text.endswith("\n") else text + "\n")
+    (THEMES_DIR / f"{name}.json").write_text(json.dumps(theme, indent=2) + "\n")
+    print(f"added {name} ({theme['scheme']}); add it to the README table")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="rex-theme", description="Manage Rex color themes.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("list", help="list themes in the library").set_defaults(func=cmd_list)
+
+    use = sub.add_parser("use", help="import a theme into Rex.app and select it")
+    use.add_argument("name")
+    use.set_defaults(func=cmd_use)
+
+    try_ = sub.add_parser("try", help="color only one block, without changing the app theme")
+    try_.add_argument("name")
+    try_.add_argument("-b", "--block", help="target block (default: $REX_BLOCK, else the focused one)")
+    try_.set_defaults(func=cmd_try)
+
+    reset = sub.add_parser("reset", help="undo `try` on a block")
+    reset.add_argument("-b", "--block", help="target block (default: $REX_BLOCK, else the focused one)")
+    reset.set_defaults(func=cmd_reset)
+
+    sub.add_parser("current", help="show the app's selected dark and light themes").set_defaults(func=cmd_current)
+
+    add = sub.add_parser("add", help="add a theme from iTerm2-Color-Schemes or a local Ghostty file")
+    add.add_argument("source", help="upstream scheme name, e.g. \"Catppuccin Frappe\"")
+    add.add_argument("name", nargs="?", help="library name (default: slug of SOURCE)")
+    add.add_argument("--file", action="store_true", help="read SOURCE from a local Ghostty theme file")
+    add.set_defaults(func=cmd_add)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except CliError as error:
+        print(f"rex-theme: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
