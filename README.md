@@ -2,6 +2,8 @@
 
 Color themes for the Rex terminal, with a small CLI to use and grow the library.
 
+[Watch the demo](assets/rex-themes-demo.mp4)
+
 ## Install
 
 ```sh
